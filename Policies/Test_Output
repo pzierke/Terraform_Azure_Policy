@@ -1,0 +1,459 @@
+
+##
+Best-practice approach:
+- create a **custom policy initiative** at the management group
+- use **built-in Azure Policy definitions** wherever they already satisfy CIS v5.0 intent
+- add **custom policy definitions** only for gaps
+- assign the initiative at the management group
+- keep the control mapping externalized so you can evolve it without rewriting everything
+
+Also: I checked for prior memory and didn’t find anything relevant.
+
+Below is a solid Terraform starter you can use as a foundation.
+
+---
+
+## Recommended file layout
+
+```text
+terraform-azure-cis/
+├── versions.tf
+├── providers.tf
+├── variables.tf
+├── locals.tf
+├── initiative.tf
+├── custom_policy_definitions.tf
+├── assignment.tf
+├── outputs.tf
+├── terraform.tfvars.example
+└── README.md
+```
+
+---
+
+## 1) `versions.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
+    }
+  }
+}
+```
+
+---
+
+## 2) `providers.tf`
+
+```hcl
+provider "azurerm" {
+  features {}
+}
+```
+
+---
+
+## 3) `variables.tf`
+
+```hcl
+variable "management_group_id" {
+  description = "The Azure Management Group ID where policies and initiative will be created."
+  type        = string
+}
+
+variable "management_group_display_name" {
+  description = "Optional display name for documentation/tagging purposes."
+  type        = string
+  default     = null
+}
+
+variable "location" {
+  description = "Azure location for assignment identity/resources where needed."
+  type        = string
+  default     = "eastus"
+}
+
+variable "initiative_name" {
+  description = "Name of the custom CIS initiative."
+  type        = string
+  default     = "cis-azure-foundations-v5-custom"
+}
+
+variable "initiative_display_name" {
+  description = "Display name of the custom initiative."
+  type        = string
+  default     = "CIS Azure Foundations Benchmark v5.0 - Custom"
+}
+
+variable "initiative_description" {
+  description = "Description for the custom initiative."
+  type        = string
+  default     = "Custom Azure Policy initiative aligned to CIS Microsoft Azure Foundations Benchmark v5.0."
+}
+
+variable "assignment_name" {
+  description = "Name of the management group assignment."
+  type        = string
+  default     = "assign-cis-azure-foundations-v5-custom"
+}
+
+variable "assignment_display_name" {
+  description = "Display name for the initiative assignment."
+  type        = string
+  default     = "Assign CIS Azure Foundations Benchmark v5.0 - Custom"
+}
+
+variable "assignment_description" {
+  description = "Description for the initiative assignment."
+  type        = string
+  default     = "Assigns the custom CIS Azure Foundations Benchmark v5.0 initiative at the management group scope."
+}
+
+variable "enforcement_mode" {
+  description = "Whether policy effects are enforced. Default enables enforcement."
+  type        = bool
+  default     = true
+}
+
+variable "policy_effect_default" {
+  description = "Default effect to use for custom policies where effect is parameterized."
+  type        = string
+  default     = "Audit"
+
+  validation {
+    condition     = contains(["Audit", "Deny", "Disabled"], var.policy_effect_default)
+    error_message = "policy_effect_default must be one of: Audit, Deny, Disabled."
+  }
+}
+
+variable "tags" {
+  description = "Optional tags/metadata map for documentation purposes."
+  type        = map(string)
+  default     = {}
+}
+```
+
+---
+
+## 4) `locals.tf`
+
+This is where we model the initiative membership.
+
+```hcl
+locals {
+  management_group_scope = "/providers/Microsoft.Management/managementGroups/${var.management_group_id}"
+
+  /*
+    Starter set only.
+    Replace the built-in definition IDs below with the exact policies you want
+    after validating your CIS v5.0 control mapping.
+
+    Best practice:
+    - keep this list small and verified
+    - add policies incrementally
+    - test assignments in a non-production management group first
+  */
+  built_in_policy_definitions = {
+    # Example placeholders. Replace with validated built-in definition IDs.
+    allowed_locations = {
+      reference_id = "allowedLocations"
+      policy_definition_id = "/providers/Microsoft.Authorization/policyDefinitions/PLACEHOLDER-ALLOWED-LOCATIONS"
+      parameters = {
+        listOfAllowedLocations = {
+          value = ["eastus", "eastus2"]
+        }
+      }
+    }
+
+    require_resource_tags = {
+      reference_id = "requireResourceTags"
+      policy_definition_id = "/providers/Microsoft.Authorization/policyDefinitions/PLACEHOLDER-REQUIRE-TAGS"
+      parameters = {}
+    }
+  }
+
+  custom_policy_definitions = {
+    storage_accounts_secure_transfer = {
+      reference_id = "storageAccountsSecureTransfer"
+      policy_definition_id = azurerm_management_group_policy_definition.storage_accounts_secure_transfer.id
+      parameters = {
+        effect = {
+          value = var.policy_effect_default
+        }
+      }
+    }
+
+    sql_servers_aad_admin = {
+      reference_id = "sqlServersAadAdmin"
+      policy_definition_id = azurerm_management_group_policy_definition.sql_servers_aad_admin.id
+      parameters = {
+        effect = {
+          value = var.policy_effect_default
+        }
+      }
+    }
+  }
+
+  initiative_policy_definitions = merge(
+    local.built_in_policy_definitions,
+    local.custom_policy_definitions
+  )
+}
+```
+
+---
+
+## 5) `custom_policy_definitions.tf`
+
+These are example custom policies. They are not a complete CIS v5.0 implementation, but they show the pattern cleanly.
+
+```hcl
+resource "azurerm_management_group_policy_definition" "storage_accounts_secure_transfer" {
+  name                 = "cis-custom-storage-accounts-secure-transfer-required"
+  management_group_id  = var.management_group_id
+  policy_type          = "Custom"
+  mode                 = "Indexed"
+  display_name         = "CIS Custom - Storage accounts should require secure transfer"
+  description          = "Audits or denies storage accounts that do not require secure transfer."
+  metadata             = jsonencode({
+    category = "CIS"
+    version  = "5.0"
+    source   = "Custom"
+  })
+
+  parameters = jsonencode({
+    effect = {
+      type         = "String"
+      metadata     = {
+        displayName = "Effect"
+        description = "Enable or disable the execution of the policy."
+      }
+      allowedValues = ["Audit", "Deny", "Disabled"]
+      defaultValue  = "Audit"
+    }
+  })
+
+  policy_rule = jsonencode({
+    if = {
+      allOf = [
+        {
+          field  = "type"
+          equals = "Microsoft.Storage/storageAccounts"
+        },
+        {
+          field  = "Microsoft.Storage/storageAccounts/supportsHttpsTrafficOnly"
+          notEquals = true
+        }
+      ]
+    }
+    then = {
+      effect = "[parameters('effect')]"
+    }
+  })
+}
+
+resource "azurerm_management_group_policy_definition" "sql_servers_aad_admin" {
+  name                 = "cis-custom-sql-servers-should-have-aad-admin"
+  management_group_id  = var.management_group_id
+  policy_type          = "Custom"
+  mode                 = "All"
+  display_name         = "CIS Custom - SQL servers should have an Azure AD administrator configured"
+  description          = "Audits SQL servers that do not have an Azure AD administrator configured."
+  metadata             = jsonencode({
+    category = "CIS"
+    version  = "5.0"
+    source   = "Custom"
+  })
+
+  parameters = jsonencode({
+    effect = {
+      type         = "String"
+      metadata     = {
+        displayName = "Effect"
+        description = "Enable or disable the execution of the policy."
+      }
+      allowedValues = ["Audit", "Deny", "Disabled"]
+      defaultValue  = "Audit"
+    }
+  })
+
+  policy_rule = jsonencode({
+    if = {
+      allOf = [
+        {
+          field  = "type"
+          equals = "Microsoft.Sql/servers"
+        },
+        {
+          count = {
+            field = "Microsoft.Sql/servers/administrators[*]"
+            where = {
+              field  = "Microsoft.Sql/servers/administrators[*].administratorType"
+              equals = "ActiveDirectory"
+            }
+          }
+          equals = 0
+        }
+      ]
+    }
+    then = {
+      effect = "[parameters('effect')]"
+    }
+  })
+}
+```
+
+---
+
+## 6) `initiative.tf`
+
+```hcl
+resource "azurerm_management_group_policy_set_definition" "cis_foundations_v5" {
+  name                = var.initiative_name
+  management_group_id = var.management_group_id
+  policy_type         = "Custom"
+  display_name        = var.initiative_display_name
+  description         = var.initiative_description
+
+  metadata = jsonencode({
+    category = "CIS"
+    version  = "5.0"
+    source   = "Terraform"
+  })
+
+  parameters = jsonencode({
+    effect = {
+      type = "String"
+      metadata = {
+        displayName = "Default Effect"
+        description = "Default effect for custom CIS policies."
+      }
+      allowedValues = ["Audit", "Deny", "Disabled"]
+      defaultValue  = var.policy_effect_default
+    }
+  })
+
+  dynamic "policy_definition_reference" {
+    for_each = local.initiative_policy_definitions
+
+    content {
+      policy_definition_id = policy_definition_reference.value.policy_definition_id
+      reference_id         = policy_definition.value.reference_id
+      parameter_values     = jsonencode(policy_definition_reference.value.parameters)
+    }
+  }
+}
+```
+
+Important fix here: in some provider versions, the dynamic block variable naming matters. If Terraform complains, use this corrected version instead:
+
+```hcl
+resource "azurerm_management_group_policy_set_definition" "cis_foundations_v5" {
+  name                = var.initiative_name
+  management_group_id = var.management_group_id
+  policy_type         = "Custom"
+  display_name        = var.initiative_display_name
+  description         = var.initiative_description
+
+  metadata = jsonencode({
+    category = "CIS"
+    version  = "5.0"
+    source   = "Terraform"
+  })
+
+  parameters = jsonencode({
+    effect = {
+      type = "String"
+      metadata = {
+        displayName = "Default Effect"
+        description = "Default effect for custom CIS policies."
+      }
+      allowedValues = ["Audit", "Deny", "Disabled"]
+      defaultValue  = var.policy_effect_default
+    }
+  })
+
+  dynamic "policy_definition_reference" {
+    for_each = local.initiative_policy_definitions
+
+    content {
+      policy_definition_id = policy_definition_reference.value.policy_definition_id
+      reference_id         = policy_definition_reference.value.reference_id
+      parameter_values     = jsonencode(policy_definition_reference.value.parameters)
+    }
+  }
+}
+```
+
+Use that second version.
+
+---
+
+## 7) `assignment.tf`
+
+```hcl
+resource "azurerm_management_group_policy_assignment" "cis_foundations_v5_assignment" {
+  name                 = var.assignment_name
+  display_name         = var.assignment_display_name
+  description          = var.assignment_description
+  management_group_id  = var.management_group_id
+  policy_definition_id = azurerm_management_group_policy_set_definition.cis_foundations_v5.id
+  location             = var.location
+  enforce              = var.enforcement_mode
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  parameters = jsonencode({
+    effect = {
+      value = var.policy_effect_default
+    }
+  })
+
+  metadata = jsonencode({
+    assignedBy = "Terraform"
+    benchmark  = "CIS Microsoft Azure Foundations Benchmark"
+    version    = "5.0"
+  })
+}
+```
+
+---
+
+## 8) `outputs.tf`
+
+```hcl
+output "management_group_scope" {
+  value = local.management_group_scope
+}
+
+output "initiative_id" {
+  value = azurerm_management_group_policy_set_definition.cis_foundations_v5.id
+}
+
+output "initiative_name" {
+  value = azurerm_management_group_policy_set_definition.cis_foundations_v5.name
+}
+
+output "assignment_id" {
+  value = azurerm_management_group_policy_assignment.cis_foundations_v5_assignment.id
+}
+```
+
+---
+
+## 9) `terraform.tfvars.example`
+
+```hcl
+management_group_id           = "my-management-group"
+management_group_display_name = "My Management Group"
+location                      = "eastus"
+
+initiative_na
+...(truncated)...
